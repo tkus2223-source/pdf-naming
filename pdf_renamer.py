@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Batch rename PDF files to: '<year> <journal_abbrev> <title>.pdf'.
 
-Key behavior:
-- Priority: filename parsing > first-page text (pymupdf then pypdf) > Crossref (optional) > PDF metadata (last)
-- Never force defaults like '0000 UNKNOWNJ Untitled' (missing parts are omitted)
-- Title is never blank: at minimum, original filename stem is used
+What’s improved here (vs basic versions):
+- Even if PDF metadata is empty, attempts to extract TITLE and YEAR from page-1 content.
+- If PyMuPDF (fitz) is available, uses font-size-aware title detection from page 1 (much better than plain text).
+- YEAR detection from page 1 uses multiple heuristics (copyright/published/citation lines),
+  then falls back to the most frequent plausible year on page 1.
+- Priority: filename parsing > page-1 (pymupdf dict/text, fallback pypdf text) > Crossref (optional) > metadata (last)
+- Never forces defaults like '0000 UNKNOWNJ Untitled'. Missing parts are omitted.
+- Title never blank: at minimum original filename stem.
 - Collision-safe names: base.pdf, base (2).pdf, base (3).pdf (no '(2) (2)' chaining)
-- Supports --dry-run, --report, timestamped rename log, and --undo
 """
 
 from __future__ import annotations
@@ -35,12 +38,40 @@ try:
 except Exception:
     PdfReader = None
 
+
 FORBIDDEN_CHARS_PATTERN = re.compile(r'[\\/:*?"<>|]')
 MULTI_SPACE_PATTERN = re.compile(r"\s+")
 DOI_PATTERN = re.compile(r"\b10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.IGNORECASE)
 YEAR_PATTERN = re.compile(r"\b(19\d{2}|20\d{2})\b")
 UPPER_TOKEN_PATTERN = re.compile(r"^[A-Z][A-Z0-9]{1,10}$")
 SUFFIX_PATTERN = re.compile(r"\s*\((\d+)\)$")
+
+# Common non-title header/footer phrases (very lightweight)
+TITLE_BAD_SUBSTRINGS = [
+    "abstract",
+    "keywords",
+    "introduction",
+    "doi",
+    "http",
+    "www.",
+    "copyright",
+    "all rights reserved",
+    "published",
+    "accepted",
+    "received",
+    "correspondence",
+    "author",
+    "authors",
+    "affiliation",
+    "department",
+    "university",
+    "hospital",
+    "volume",
+    "issue",
+    "pages",
+    "pp.",
+    "©",
+]
 
 
 @dataclass
@@ -91,7 +122,7 @@ def detect_year(text: str) -> Optional[str]:
 
 def load_journal_map(path: Path) -> Dict[str, str]:
     """journals.json: { "Full Journal Name": "ABBR", ... }.
-    Keys are matched case-insensitively by substring for filename parsing and by exact (lowercased) for Crossref/metadata names.
+    Keys stored lowercased; values sanitized.
     """
     if not path.exists():
         return {}
@@ -109,7 +140,6 @@ def load_journal_map(path: Path) -> Dict[str, str]:
 
 
 def abbreviate_journal(journal: str) -> str:
-    # Simple initials-based abbreviation with a short fallback.
     tokens = [t for t in re.split(r"[^A-Za-z0-9]+", journal) if t]
     initials = "".join(t[0].upper() for t in tokens if t)
     if 2 <= len(initials) <= 10:
@@ -119,40 +149,42 @@ def abbreviate_journal(journal: str) -> str:
 
 
 def parse_from_filename(path: Path, journal_map: Dict[str, str]) -> PdfInfo:
+    """Best-effort parse from filename stem.
+    Note: this is a conservative parser; page-1 extraction handles cases filename is messy.
+    """
     info = PdfInfo()
     stem = sanitize_text(path.stem)
 
-    # Title fallback: always at least filename stem
+    # title fallback: always at least filename stem
     set_if_empty(info.title, stem, "filename")
 
-    # Year from filename
+    # year
     year = detect_year(stem)
     set_if_empty(info.year, year, "filename")
 
     tokens = stem.split()
     journal_candidate: Optional[str] = None
 
-    # Journal token: prefer obvious abbrev tokens (NEJM, BJA, JAMA...)
+    # obvious abbrev token: NEJM, BJA, JAMA...
     for tok in tokens:
         if UPPER_TOKEN_PATTERN.match(tok) and not YEAR_PATTERN.fullmatch(tok):
             journal_candidate = tok
             break
 
-    # Journal mapping by substring against full journal name (from journals.json)
+    # substring match full journal name from map
     if not journal_candidate and journal_map:
         lowered = stem.lower()
         for full_name_lc, abbr in journal_map.items():
-            if full_name_lc and full_name_lc in lowered:
+            if full_name_lc in lowered:
                 journal_candidate = abbr
                 break
 
     if journal_candidate:
         set_if_empty(info.journal, journal_candidate, "filename")
 
-    # Candidate title = remaining tokens minus detected year and journal token(s)
+    # title candidate: remaining tokens minus year and journal token
     if info.year.value:
         tokens = [t for t in tokens if t != info.year.value]
-
     if info.journal.value:
         jv = info.journal.value
         tokens = [t for t in tokens if t != jv]
@@ -191,18 +223,207 @@ def extract_text_pypdf(pdf_path: Path) -> str:
         return ""
 
 
-def detect_title_from_text(text: str) -> Optional[str]:
-    # Heuristic: pick the first "title-like" line (not DOI/year, long enough, 4+ words)
-    for line in (sanitize_text(l) for l in (text or "").splitlines()):
-        if len(line) < 20:
+def extract_page1_lines_with_fonts_pymupdf(pdf_path: Path) -> List[Tuple[str, float]]:
+    """Return list of (line_text, approx_font_size) from page 1 using PyMuPDF.
+    If anything fails, returns [].
+    """
+    if fitz is None:
+        return []
+    try:
+        doc = fitz.open(pdf_path)
+        if doc.page_count == 0:
+            return []
+        page = doc[0]
+        d = page.get_text("dict")
+        doc.close()
+
+        out: List[Tuple[str, float]] = []
+        for block in d.get("blocks", []):
+            if block.get("type") != 0:  # text blocks
+                continue
+            for line in block.get("lines", []):
+                spans = line.get("spans", [])
+                if not spans:
+                    continue
+                texts = []
+                sizes = []
+                for sp in spans:
+                    t = sp.get("text", "")
+                    if t and t.strip():
+                        texts.append(t.strip())
+                        try:
+                            sizes.append(float(sp.get("size", 0.0)))
+                        except Exception:
+                            pass
+                if not texts:
+                    continue
+                line_text = sanitize_text(" ".join(texts))
+                if not line_text:
+                    continue
+                font_size = sum(sizes) / len(sizes) if sizes else 0.0
+                out.append((line_text, font_size))
+        return out
+    except Exception:
+        return []
+
+
+def looks_like_title_line(line: str) -> bool:
+    """Heuristic for title-like lines (text-only fallback)."""
+    line_s = sanitize_text(line)
+    if len(line_s) < 25:
+        return False
+    if DOI_PATTERN.search(line_s) or YEAR_PATTERN.search(line_s):
+        return False
+    words = line_s.split()
+    if len(words) < 5:
+        return False
+    low = line_s.lower()
+    if any(bad in low for bad in TITLE_BAD_SUBSTRINGS):
+        return False
+    # Avoid lines that are almost all uppercase (often headers)
+    letters = [c for c in line_s if c.isalpha()]
+    if letters:
+        upper_ratio = sum(c.isupper() for c in letters) / len(letters)
+        if upper_ratio > 0.85:
+            return False
+    return True
+
+
+def detect_title_from_page1(text: str) -> Optional[str]:
+    """Text-only fallback title detection."""
+    best: Optional[str] = None
+    best_score = -1.0
+    for raw in (text or "").splitlines():
+        line = sanitize_text(raw)
+        if not looks_like_title_line(line):
             continue
-        if DOI_PATTERN.search(line) or YEAR_PATTERN.search(line):
+        # score: longer + more words, penalize very long (often includes affiliations)
+        n = len(line)
+        w = len(line.split())
+        score = (w * 3.0) + (n * 0.05)
+        if n > 140:
+            score -= 10
+        if score > best_score:
+            best_score = score
+            best = line
+    return best
+
+
+def detect_title_from_page1_pymupdf_fonts(pdf_path: Path) -> Optional[str]:
+    """Font-aware title detection.
+    Strategy:
+      - rank by font size (desc), focus on top region lines by size
+      - filter out obvious non-title lines
+      - pick best candidate by (font_size, words, length)
+    """
+    lines = extract_page1_lines_with_fonts_pymupdf(pdf_path)
+    if not lines:
+        return None
+
+    # Consider top font sizes first
+    lines_sorted = sorted(lines, key=lambda x: x[1], reverse=True)
+
+    # Determine a threshold: lines within 90% of max font size are likely title candidates
+    max_size = lines_sorted[0][1] if lines_sorted else 0.0
+    if max_size <= 0:
+        return None
+    threshold = max_size * 0.90
+
+    candidates: List[Tuple[str, float, float]] = []  # (line, size, score)
+    for line, size in lines_sorted[:80]:
+        if size < threshold:
+            # still allow a few next lines (titles sometimes split across 2 sizes)
+            if size < max_size * 0.80:
+                break
+        if not looks_like_title_line(line):
             continue
-        words = line.split()
-        if len(words) < 4:
+        words = len(line.split())
+        length = len(line)
+        # score: font size dominates, then word count/length
+        score = (size * 10.0) + (words * 2.0) + (length * 0.02)
+        candidates.append((line, size, score))
+
+    if not candidates:
+        # fallback: try any title-like lines, not just top-size
+        for line, size in lines_sorted[:120]:
+            if not looks_like_title_line(line):
+                continue
+            words = len(line.split())
+            length = len(line)
+            score = (size * 6.0) + (words * 2.0) + (length * 0.02)
+            candidates.append((line, size, score))
+
+    if not candidates:
+        return None
+
+    # sometimes titles are split across two consecutive big lines; merge adjacent candidates if they look like continuation
+    best_line, _, _ = max(candidates, key=lambda x: x[2])
+
+    # Try to append the next line if it is also big and title-like but shorter (continuation)
+    # This is conservative: only if combined looks better and remains reasonable length
+    try_merge = []
+    for line, size in lines_sorted:
+        if line == best_line:
             continue
-        return line
-    return None
+        if size < max_size * 0.85:
+            continue
+        if not looks_like_title_line(line):
+            continue
+        # merge candidate if it does not repeat too much and combined length reasonable
+        if len(best_line) < 120 and len(line) < 80:
+            combined = sanitize_text(best_line + " " + line)
+            if looks_like_title_line(combined) and len(combined) <= 170:
+                try_merge.append(combined)
+
+    if try_merge:
+        # pick the longest merged (often the true full title)
+        merged_best = max(try_merge, key=lambda s: len(s))
+        return merged_best
+
+    return best_line
+
+
+def detect_year_from_page1(text: str) -> Optional[str]:
+    """Heuristic year detection from page-1 text.
+
+    Steps:
+      1) Prefer years on lines with patterns: ©, copyright, published, accepted, received, journal citation-like.
+      2) Else choose the most frequent plausible year on page 1.
+    """
+    if not text:
+        return None
+
+    current_year = dt.datetime.now().year
+    min_year = 1900
+
+    def valid(y: str) -> bool:
+        try:
+            yi = int(y)
+        except Exception:
+            return False
+        return min_year <= yi <= current_year
+
+    lines = [sanitize_text(l) for l in text.splitlines() if sanitize_text(l)]
+    if not lines:
+        return None
+
+    priority_hits: List[str] = []
+    for line in lines[:80]:
+        low = line.lower()
+        if any(k in low for k in ["©", "copyright", "published", "accepted", "received", "online", "journal", "vol", "volume"]):
+            for y in YEAR_PATTERN.findall(line):
+                if valid(y):
+                    priority_hits.append(y)
+
+    if priority_hits:
+        # if multiple, choose the most frequent among priority lines
+        return max(set(priority_hits), key=priority_hits.count)
+
+    # fallback: mode of all years on page 1
+    years_all = [y for y in YEAR_PATTERN.findall(text) if valid(y)]
+    if not years_all:
+        return None
+    return max(set(years_all), key=years_all.count)
 
 
 def extract_metadata(pdf_path: Path) -> Dict[str, str]:
@@ -222,7 +443,7 @@ def extract_metadata(pdf_path: Path) -> Dict[str, str]:
 
 def crossref_lookup(doi: str, timeout: float = 8.0) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     url = f"https://api.crossref.org/works/{urllib.parse.quote(doi)}"
-    req = urllib.request.Request(url, headers={"User-Agent": "pdf-renamer/2.1"})
+    req = urllib.request.Request(url, headers={"User-Agent": "pdf-renamer/2.2"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             payload = json.loads(r.read().decode("utf-8", errors="replace"))
@@ -248,12 +469,10 @@ def choose_journal_abbrev(journal: Optional[str], journal_map: Dict[str, str]) -
     if not j_clean:
         return None
 
-    # Exact mapping (case-insensitive) for known full names (Crossref/metadata)
     mapped = journal_map.get(j_clean.lower())
     if mapped:
         return mapped
 
-    # If already looks like an abbrev token, keep it
     if UPPER_TOKEN_PATTERN.match(j_clean):
         return j_clean
 
@@ -261,7 +480,7 @@ def choose_journal_abbrev(journal: Optional[str], journal_map: Dict[str, str]) -
 
 
 def build_name(info: PdfInfo, journal_map: Dict[str, str], max_len: int = 160) -> str:
-    # Never force defaults; omit missing parts
+    # Do not force defaults; omit missing parts
     title = sanitize_text(info.title.value or "")
     if not title:
         title = "document"
@@ -275,7 +494,6 @@ def build_name(info: PdfInfo, journal_map: Dict[str, str], max_len: int = 160) -
     if not stem:
         stem = sanitize_text(info.title.value or "") or "document"
 
-    # Enforce max length (including ".pdf")
     if len(stem) + 4 > max_len:
         overflow = len(stem) + 4 - max_len
         title_cut = title[:-overflow].rstrip() if overflow < len(title) else title[:40].rstrip()
@@ -296,7 +514,6 @@ def strip_numeric_suffix(stem: str) -> str:
 
 
 def unique_destination(src: Path, desired: Path, seen: set[Path]) -> Path:
-    """Return a collision-free destination. Avoids '(2) (2)' by stripping numeric suffixes first."""
     base = strip_numeric_suffix(desired.stem)
     first = desired.with_name(f"{base}{desired.suffix}")
 
@@ -319,7 +536,7 @@ def unique_destination(src: Path, desired: Path, seen: set[Path]) -> Path:
 
 
 def enrich_info(pdf_path: Path, info: PdfInfo, use_crossref: bool) -> None:
-    # First page text (prefer pymupdf)
+    # Page-1 extraction (prefer PyMuPDF)
     text = extract_text_pymupdf(pdf_path)
     text_source = "pdftext:pymupdf"
     if not text:
@@ -327,11 +544,20 @@ def enrich_info(pdf_path: Path, info: PdfInfo, use_crossref: bool) -> None:
         text_source = "pdftext:pypdf"
 
     if text:
+        # DOI from page 1
         set_if_empty(info.doi, detect_doi(text), text_source)
-        set_if_empty(info.title, detect_title_from_text(text), text_source)
-        # Year/journal from text are unreliable; keep them for metadata/crossref unless you add more rules.
 
-    # Crossref enrichment (only when asked and DOI found)
+        # Improved TITLE from page 1: font-aware if available
+        title_from_fonts = detect_title_from_page1_pymupdf_fonts(pdf_path) if fitz is not None else None
+        if title_from_fonts:
+            set_if_empty(info.title, title_from_fonts, "pdftext:pymupdf:fonts")
+        else:
+            set_if_empty(info.title, detect_title_from_page1(text), text_source)
+
+        # Improved YEAR from page 1 text (do this before metadata)
+        set_if_empty(info.year, detect_year_from_page1(text), text_source)
+
+    # Crossref enrichment (optional) if DOI found
     if use_crossref and info.doi.value:
         y, j, t = crossref_lookup(info.doi.value)
         set_if_empty(info.year, y, "crossref")
@@ -426,7 +652,8 @@ def execute(plans: List[RenamePlan], dry_run: bool, log_dir: Path) -> Optional[P
             f"{p.src.name} -> {p.dest.name} | "
             f"year={p.info.year.value or '-'}({source_of(p.info.year)}), "
             f"journal={p.info.journal.value or '-'}({source_of(p.info.journal)}), "
-            f"title={p.info.title.value or '-'}({source_of(p.info.title)})"
+            f"title={p.info.title.value or '-'}({source_of(p.info.title)}), "
+            f"doi={p.info.doi.value or '-'}({source_of(p.info.doi)})"
         )
 
         status = "dry-run"
@@ -457,7 +684,6 @@ def undo(log_path: Path, dry_run: bool) -> None:
     with log_path.open("r", encoding="utf-8", newline="") as f:
         rows = list(csv.DictReader(f))
 
-    # Reverse order to safely handle rename chains
     for row in reversed(rows):
         status = row.get("status", "")
         if status != "renamed":
