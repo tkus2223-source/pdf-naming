@@ -175,20 +175,6 @@ def detect_title_from_text(text: str) -> Optional[str]:
     return None
 
 
-def extract_metadata(pdf_path: Path) -> Dict[str, str]:
-    if PdfReader is None:
-        return {}
-    try:
-        reader = PdfReader(str(pdf_path))
-        meta = reader.metadata or {}
-        out = {}
-        for k, v in meta.items():
-            if v is not None:
-                out[str(k)] = str(v)
-        return out
-    except Exception:
-        return {}
-
 
 def crossref_lookup(doi: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     url = f"https://api.crossref.org/works/{urllib.parse.quote(doi)}"
@@ -288,13 +274,6 @@ def enrich_info(pdf_path: Path, info: PdfInfo, use_crossref: bool) -> None:
         set_if_empty(info.journal, j, "crossref")
         set_if_empty(info.title, t, "crossref")
 
-    meta = extract_metadata(pdf_path)
-    if meta:
-        set_if_empty(info.year, detect_year(meta.get("/CreationDate", "")), "metadata")
-        set_if_empty(info.journal, meta.get("/Journal") or meta.get("/Subject"), "metadata")
-        set_if_empty(info.title, meta.get("/Title"), "metadata")
-        if not info.doi.value:
-            set_if_empty(info.doi, detect_doi("\n".join(meta.values())), "metadata")
 
 
 def plan_renames(folder: Path, journal_map: Dict[str, str], use_crossref: bool) -> List[RenamePlan]:

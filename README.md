@@ -11,7 +11,6 @@
 1. **파일명 파싱** (최우선)
 2. **PDF 1페이지 텍스트(기본: pymupdf, fallback: pypdf)** 에서 DOI/제목 추출
 3. **Crossref 조회**로 year/journal/title 보완 (`--use-crossref` 사용 시)
-4. **PDF metadata**는 마지막 fallback
 
 중요:
 - 정보가 부족해도 `0000 UNKNOWNJ Untitled` 같은 강제 기본값으로 덮어쓰지 않습니다.
@@ -33,7 +32,7 @@ python pdf_renamer.py --dry-run --report report.csv
 
 출력:
 - `원본 -> 새이름`
-- `year/journal/title` 값과 각각의 source (`filename`, `pdftext:pymupdf`, `crossref`, `metadata`)
+- `year/journal/title` 값과 각각의 source (`filename`, `pdftext:pymupdf`, `pdftext:pypdf`, `crossref`)
 
 ### Crossref 보완 사용
 
