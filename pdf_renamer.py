@@ -1,15 +1,32 @@
 #!/usr/bin/env python3
 """Batch rename PDF files to: '<year> <journal_abbrev> <title>.pdf'.
 
-What’s improved here (vs basic versions):
-- Even if PDF metadata is empty, attempts to extract TITLE and YEAR from page-1 content.
-- If PyMuPDF (fitz) is available, uses font-size-aware title detection from page 1 (much better than plain text).
-- YEAR detection from page 1 uses multiple heuristics (copyright/published/citation lines),
-  then falls back to the most frequent plausible year on page 1.
-- Priority: filename parsing > page-1 (pymupdf dict/text, fallback pypdf text) > Crossref (optional) > metadata (last)
-- Never forces defaults like '0000 UNKNOWNJ Untitled'. Missing parts are omitted.
-- Title never blank: at minimum original filename stem.
-- Collision-safe names: base.pdf, base (2).pdf, base (3).pdf (no '(2) (2)' chaining)
+Adds PubMed enrichment (NCBI E-utilities):
+- Extract DOI and/or title candidate from page 1
+- Query PubMed by DOI first, else by title
+- Use PubMed fields to set:
+  - year (PubDate / ArticleDate)
+  - journal abbreviation (ISOAbbreviation preferred, else MedlineTA)
+  - title (official Title)
+- Priority:
+  1) filename parsing
+  2) page-1 extraction (PyMuPDF font-aware title + year heuristics; fallback pypdf text)
+  3) PubMed enrichment (DOI then title)
+  4) Crossref enrichment (optional)
+  5) PDF metadata last
+- Never forces defaults like '0000 UNKNOWNJ Untitled' (missing parts are omitted)
+- Title never blank (falls back to filename stem)
+- Collision-safe naming: base.pdf, base (2).pdf, base (3).pdf
+- NCBI API key: NOT used. Rate-limited to ~3 req/sec.
+
+Install:
+  pip install pymupdf pypdf
+
+Usage:
+  python pdf_renamer.py --dry-run --use-pubmed --report report.csv
+  python pdf_renamer.py --dry-run --use-pubmed --use-crossref
+  python pdf_renamer.py --use-pubmed
+  python pdf_renamer.py --undo logs/rename_log_YYYYmmdd_HHMMSS.csv
 """
 
 from __future__ import annotations
@@ -21,6 +38,7 @@ import json
 import re
 import sys
 import textwrap
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -39,6 +57,14 @@ except Exception:
     PdfReader = None
 
 
+# --- Config ---
+PUBMED_EMAIL = "tkus1234@gmail.com"
+PUBMED_TOOL = "pdf_renamer"
+PUBMED_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+# Without API key, NCBI guidance is ~3 requests/sec. Use ~0.35s delay per request.
+PUBMED_MIN_DELAY_SEC = 0.35
+
+
 FORBIDDEN_CHARS_PATTERN = re.compile(r'[\\/:*?"<>|]')
 MULTI_SPACE_PATTERN = re.compile(r"\s+")
 DOI_PATTERN = re.compile(r"\b10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.IGNORECASE)
@@ -46,7 +72,6 @@ YEAR_PATTERN = re.compile(r"\b(19\d{2}|20\d{2})\b")
 UPPER_TOKEN_PATTERN = re.compile(r"^[A-Z][A-Z0-9]{1,10}$")
 SUFFIX_PATTERN = re.compile(r"\s*\((\d+)\)$")
 
-# Common non-title header/footer phrases (very lightweight)
 TITLE_BAD_SUBSTRINGS = [
     "abstract",
     "keywords",
@@ -95,6 +120,7 @@ class RenamePlan:
     info: PdfInfo
 
 
+# --- Utility ---
 def sanitize_text(text: str) -> str:
     text = (text or "").replace("_", " ")
     text = FORBIDDEN_CHARS_PATTERN.sub(" ", text)
@@ -121,9 +147,7 @@ def detect_year(text: str) -> Optional[str]:
 
 
 def load_journal_map(path: Path) -> Dict[str, str]:
-    """journals.json: { "Full Journal Name": "ABBR", ... }.
-    Keys stored lowercased; values sanitized.
-    """
+    """journals.json: { "Full Journal Name": "ABBR", ... }."""
     if not path.exists():
         return {}
     try:
@@ -148,24 +172,20 @@ def abbreviate_journal(journal: str) -> str:
     return short[:24].rstrip() if len(short) > 24 else short
 
 
+# --- Filename parsing ---
 def parse_from_filename(path: Path, journal_map: Dict[str, str]) -> PdfInfo:
-    """Best-effort parse from filename stem.
-    Note: this is a conservative parser; page-1 extraction handles cases filename is messy.
-    """
     info = PdfInfo()
     stem = sanitize_text(path.stem)
 
-    # title fallback: always at least filename stem
-    set_if_empty(info.title, stem, "filename")
+    set_if_empty(info.title, stem, "filename")  # always at least filename stem
 
-    # year
     year = detect_year(stem)
     set_if_empty(info.year, year, "filename")
 
     tokens = stem.split()
     journal_candidate: Optional[str] = None
 
-    # obvious abbrev token: NEJM, BJA, JAMA...
+    # obvious abbrev token (NEJM, BJA, JAMA...)
     for tok in tokens:
         if UPPER_TOKEN_PATTERN.match(tok) and not YEAR_PATTERN.fullmatch(tok):
             journal_candidate = tok
@@ -197,6 +217,7 @@ def parse_from_filename(path: Path, journal_map: Dict[str, str]) -> PdfInfo:
     return info
 
 
+# --- PDF extraction ---
 def extract_text_pymupdf(pdf_path: Path) -> str:
     if fitz is None:
         return ""
@@ -224,9 +245,6 @@ def extract_text_pypdf(pdf_path: Path) -> str:
 
 
 def extract_page1_lines_with_fonts_pymupdf(pdf_path: Path) -> List[Tuple[str, float]]:
-    """Return list of (line_text, approx_font_size) from page 1 using PyMuPDF.
-    If anything fails, returns [].
-    """
     if fitz is None:
         return []
     try:
@@ -239,7 +257,7 @@ def extract_page1_lines_with_fonts_pymupdf(pdf_path: Path) -> List[Tuple[str, fl
 
         out: List[Tuple[str, float]] = []
         for block in d.get("blocks", []):
-            if block.get("type") != 0:  # text blocks
+            if block.get("type") != 0:
                 continue
             for line in block.get("lines", []):
                 spans = line.get("spans", [])
@@ -268,7 +286,6 @@ def extract_page1_lines_with_fonts_pymupdf(pdf_path: Path) -> List[Tuple[str, fl
 
 
 def looks_like_title_line(line: str) -> bool:
-    """Heuristic for title-like lines (text-only fallback)."""
     line_s = sanitize_text(line)
     if len(line_s) < 25:
         return False
@@ -280,7 +297,6 @@ def looks_like_title_line(line: str) -> bool:
     low = line_s.lower()
     if any(bad in low for bad in TITLE_BAD_SUBSTRINGS):
         return False
-    # Avoid lines that are almost all uppercase (often headers)
     letters = [c for c in line_s if c.isalpha()]
     if letters:
         upper_ratio = sum(c.isupper() for c in letters) / len(letters)
@@ -289,15 +305,13 @@ def looks_like_title_line(line: str) -> bool:
     return True
 
 
-def detect_title_from_page1(text: str) -> Optional[str]:
-    """Text-only fallback title detection."""
+def detect_title_from_page1_text(text: str) -> Optional[str]:
     best: Optional[str] = None
     best_score = -1.0
     for raw in (text or "").splitlines():
         line = sanitize_text(raw)
         if not looks_like_title_line(line):
             continue
-        # score: longer + more words, penalize very long (often includes affiliations)
         n = len(line)
         w = len(line.split())
         score = (w * 3.0) + (n * 0.05)
@@ -310,105 +324,58 @@ def detect_title_from_page1(text: str) -> Optional[str]:
 
 
 def detect_title_from_page1_pymupdf_fonts(pdf_path: Path) -> Optional[str]:
-    """Font-aware title detection.
-    Strategy:
-      - rank by font size (desc), focus on top region lines by size
-      - filter out obvious non-title lines
-      - pick best candidate by (font_size, words, length)
-    """
     lines = extract_page1_lines_with_fonts_pymupdf(pdf_path)
     if not lines:
         return None
 
-    # Consider top font sizes first
     lines_sorted = sorted(lines, key=lambda x: x[1], reverse=True)
-
-    # Determine a threshold: lines within 90% of max font size are likely title candidates
     max_size = lines_sorted[0][1] if lines_sorted else 0.0
     if max_size <= 0:
         return None
-    threshold = max_size * 0.90
 
-    candidates: List[Tuple[str, float, float]] = []  # (line, size, score)
-    for line, size in lines_sorted[:80]:
-        if size < threshold:
-            # still allow a few next lines (titles sometimes split across 2 sizes)
-            if size < max_size * 0.80:
-                break
+    threshold = max_size * 0.90
+    candidates: List[Tuple[str, float]] = []
+
+    for line, size in lines_sorted[:100]:
+        if size < threshold and size < max_size * 0.80:
+            break
         if not looks_like_title_line(line):
             continue
-        words = len(line.split())
-        length = len(line)
-        # score: font size dominates, then word count/length
-        score = (size * 10.0) + (words * 2.0) + (length * 0.02)
-        candidates.append((line, size, score))
+        candidates.append((line, size))
 
     if not candidates:
-        # fallback: try any title-like lines, not just top-size
-        for line, size in lines_sorted[:120]:
+        for line, size in lines_sorted[:140]:
             if not looks_like_title_line(line):
                 continue
-            words = len(line.split())
-            length = len(line)
-            score = (size * 6.0) + (words * 2.0) + (length * 0.02)
-            candidates.append((line, size, score))
+            candidates.append((line, size))
 
     if not candidates:
         return None
 
-    # sometimes titles are split across two consecutive big lines; merge adjacent candidates if they look like continuation
-    best_line, _, _ = max(candidates, key=lambda x: x[2])
-
-    # Try to append the next line if it is also big and title-like but shorter (continuation)
-    # This is conservative: only if combined looks better and remains reasonable length
-    try_merge = []
-    for line, size in lines_sorted:
-        if line == best_line:
-            continue
-        if size < max_size * 0.85:
-            continue
-        if not looks_like_title_line(line):
-            continue
-        # merge candidate if it does not repeat too much and combined length reasonable
-        if len(best_line) < 120 and len(line) < 80:
-            combined = sanitize_text(best_line + " " + line)
-            if looks_like_title_line(combined) and len(combined) <= 170:
-                try_merge.append(combined)
-
-    if try_merge:
-        # pick the longest merged (often the true full title)
-        merged_best = max(try_merge, key=lambda s: len(s))
-        return merged_best
-
+    # choose by size then length
+    best_line, _ = max(candidates, key=lambda t: (t[1], len(t[0])))
     return best_line
 
 
 def detect_year_from_page1(text: str) -> Optional[str]:
-    """Heuristic year detection from page-1 text.
-
-    Steps:
-      1) Prefer years on lines with patterns: ©, copyright, published, accepted, received, journal citation-like.
-      2) Else choose the most frequent plausible year on page 1.
-    """
     if not text:
         return None
 
     current_year = dt.datetime.now().year
-    min_year = 1900
 
     def valid(y: str) -> bool:
         try:
             yi = int(y)
         except Exception:
             return False
-        return min_year <= yi <= current_year
+        return 1900 <= yi <= current_year
 
     lines = [sanitize_text(l) for l in text.splitlines() if sanitize_text(l)]
     if not lines:
         return None
 
     priority_hits: List[str] = []
-    for line in lines[:80]:
+    for line in lines[:100]:
         low = line.lower()
         if any(k in low for k in ["©", "copyright", "published", "accepted", "received", "online", "journal", "vol", "volume"]):
             for y in YEAR_PATTERN.findall(line):
@@ -416,10 +383,8 @@ def detect_year_from_page1(text: str) -> Optional[str]:
                     priority_hits.append(y)
 
     if priority_hits:
-        # if multiple, choose the most frequent among priority lines
         return max(set(priority_hits), key=priority_hits.count)
 
-    # fallback: mode of all years on page 1
     years_all = [y for y in YEAR_PATTERN.findall(text) if valid(y)]
     if not years_all:
         return None
@@ -441,9 +406,161 @@ def extract_metadata(pdf_path: Path) -> Dict[str, str]:
         return {}
 
 
+# --- PubMed enrichment (NCBI E-utilities) ---
+_last_pubmed_call_ts = 0.0
+
+
+def _pubmed_throttle() -> None:
+    global _last_pubmed_call_ts
+    now = time.time()
+    elapsed = now - _last_pubmed_call_ts
+    if elapsed < PUBMED_MIN_DELAY_SEC:
+        time.sleep(PUBMED_MIN_DELAY_SEC - elapsed)
+    _last_pubmed_call_ts = time.time()
+
+
+def _http_get_json(url: str, timeout: float = 10.0) -> Optional[dict]:
+    _pubmed_throttle()
+    req = urllib.request.Request(url, headers={"User-Agent": f"{PUBMED_TOOL}/1.0 ({PUBMED_EMAIL})"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", errors="replace"))
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError):
+        return None
+
+
+def _http_get_text(url: str, timeout: float = 10.0) -> Optional[str]:
+    _pubmed_throttle()
+    req = urllib.request.Request(url, headers={"User-Agent": f"{PUBMED_TOOL}/1.0 ({PUBMED_EMAIL})"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError):
+        return None
+
+
+def pubmed_esearch(term: str, retmax: int = 3) -> List[str]:
+    """Return PMID list for a search term."""
+    params = {
+        "db": "pubmed",
+        "term": term,
+        "retmode": "json",
+        "retmax": str(retmax),
+        "tool": PUBMED_TOOL,
+        "email": PUBMED_EMAIL,
+    }
+    url = PUBMED_BASE + "esearch.fcgi?" + urllib.parse.urlencode(params)
+    data = _http_get_json(url)
+    if not data:
+        return []
+    return (data.get("esearchresult", {}) or {}).get("idlist", []) or []
+
+
+def pubmed_esummary(pmids: List[str]) -> Optional[dict]:
+    """Return esummary JSON for PMIDs."""
+    if not pmids:
+        return None
+    params = {
+        "db": "pubmed",
+        "id": ",".join(pmids),
+        "retmode": "json",
+        "tool": PUBMED_TOOL,
+        "email": PUBMED_EMAIL,
+    }
+    url = PUBMED_BASE + "esummary.fcgi?" + urllib.parse.urlencode(params)
+    return _http_get_json(url)
+
+
+def _parse_year_from_pubdate(pubdate: str) -> Optional[str]:
+    # Examples: "2018 Aug", "2019", "2017 Dec 15", "2018-01-10"
+    if not pubdate:
+        return None
+    y = detect_year(pubdate)
+    return y
+
+
+def pubmed_lookup_by_doi(doi: str) -> Optional[Dict[str, Optional[str]]]:
+    """Lookup PubMed by DOI. Return dict with year, journal_abbrev, title, pmid."""
+    if not doi:
+        return None
+    term = f"{doi}[DOI]"
+    pmids = pubmed_esearch(term=term, retmax=3)
+    if not pmids:
+        return None
+    summ = pubmed_esummary(pmids)
+    if not summ:
+        return None
+    result = summ.get("result", {}) or {}
+    uids = result.get("uids", []) or []
+    for uid in uids:
+        rec = result.get(str(uid), {}) or {}
+        title = rec.get("title") or None
+        # Some titles end with a period in PubMed summary; strip trailing period.
+        if isinstance(title, str):
+            title = title.strip().rstrip(".").strip() or None
+
+        # Journal abbreviation: ISOAbbreviation preferred; fallback MedlineTA
+        journal_abbrev = rec.get("isoabbreviation") or rec.get("medlineta") or None
+        if isinstance(journal_abbrev, str):
+            journal_abbrev = journal_abbrev.strip() or None
+
+        year = _parse_year_from_pubdate(rec.get("pubdate") or "")
+        # In some cases, pubdate may be empty; try sortpubdate-like fields if present
+        if not year:
+            year = _parse_year_from_pubdate(rec.get("sortpubdate") or "")
+
+        return {"pmid": str(uid), "year": year, "journal_abbrev": journal_abbrev, "title": title}
+    return None
+
+
+def pubmed_lookup_by_title(title: str) -> Optional[Dict[str, Optional[str]]]:
+    """Lookup PubMed by Title. Return dict with year, journal_abbrev, title, pmid.
+    Uses exact-ish title search; still may return multiple hits, we take the top match.
+    """
+    if not title:
+        return None
+
+    # Quote the title to make it stricter; use [Title] field
+    # For very long titles, PubMed may be picky; keep it reasonable.
+    q = sanitize_text(title)
+    if len(q) > 220:
+        q = q[:220].rstrip()
+    term = f"\"{q}\"[Title]"
+    pmids = pubmed_esearch(term=term, retmax=3)
+    if not pmids:
+        # fallback: unquoted (looser)
+        term2 = f"{q}[Title]"
+        pmids = pubmed_esearch(term=term2, retmax=3)
+        if not pmids:
+            return None
+
+    summ = pubmed_esummary(pmids)
+    if not summ:
+        return None
+    result = summ.get("result", {}) or {}
+    uids = result.get("uids", []) or []
+    for uid in uids:
+        rec = result.get(str(uid), {}) or {}
+        pm_title = rec.get("title") or None
+        if isinstance(pm_title, str):
+            pm_title = pm_title.strip().rstrip(".").strip() or None
+
+        journal_abbrev = rec.get("isoabbreviation") or rec.get("medlineta") or None
+        if isinstance(journal_abbrev, str):
+            journal_abbrev = journal_abbrev.strip() or None
+
+        year = _parse_year_from_pubdate(rec.get("pubdate") or "")
+        if not year:
+            year = _parse_year_from_pubdate(rec.get("sortpubdate") or "")
+
+        return {"pmid": str(uid), "year": year, "journal_abbrev": journal_abbrev, "title": pm_title}
+    return None
+
+
+# --- Crossref enrichment (optional) ---
 def crossref_lookup(doi: str, timeout: float = 8.0) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     url = f"https://api.crossref.org/works/{urllib.parse.quote(doi)}"
-    req = urllib.request.Request(url, headers={"User-Agent": "pdf-renamer/2.2"})
+    req = urllib.request.Request(url, headers={"User-Agent": "pdf-renamer/2.3"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             payload = json.loads(r.read().decode("utf-8", errors="replace"))
@@ -479,8 +596,8 @@ def choose_journal_abbrev(journal: Optional[str], journal_map: Dict[str, str]) -
     return abbreviate_journal(j_clean)
 
 
+# --- Naming ---
 def build_name(info: PdfInfo, journal_map: Dict[str, str], max_len: int = 160) -> str:
-    # Do not force defaults; omit missing parts
     title = sanitize_text(info.title.value or "")
     if not title:
         title = "document"
@@ -490,9 +607,7 @@ def build_name(info: PdfInfo, journal_map: Dict[str, str], max_len: int = 160) -
     journal = choose_journal_abbrev(journal_raw, journal_map) if journal_raw else ""
 
     parts = [p for p in [year, journal, title] if p]
-    stem = sanitize_text(" ".join(parts))
-    if not stem:
-        stem = sanitize_text(info.title.value or "") or "document"
+    stem = sanitize_text(" ".join(parts)) or title
 
     if len(stem) + 4 > max_len:
         overflow = len(stem) + 4 - max_len
@@ -535,8 +650,9 @@ def unique_destination(src: Path, desired: Path, seen: set[Path]) -> Path:
         i += 1
 
 
-def enrich_info(pdf_path: Path, info: PdfInfo, use_crossref: bool) -> None:
-    # Page-1 extraction (prefer PyMuPDF)
+# --- Enrichment pipeline ---
+def enrich_info(pdf_path: Path, info: PdfInfo, use_pubmed: bool, use_crossref: bool) -> None:
+    # Page-1 extraction
     text = extract_text_pymupdf(pdf_path)
     text_source = "pdftext:pymupdf"
     if not text:
@@ -544,20 +660,36 @@ def enrich_info(pdf_path: Path, info: PdfInfo, use_crossref: bool) -> None:
         text_source = "pdftext:pypdf"
 
     if text:
-        # DOI from page 1
         set_if_empty(info.doi, detect_doi(text), text_source)
 
-        # Improved TITLE from page 1: font-aware if available
+        # Title from fonts if possible
         title_from_fonts = detect_title_from_page1_pymupdf_fonts(pdf_path) if fitz is not None else None
         if title_from_fonts:
             set_if_empty(info.title, title_from_fonts, "pdftext:pymupdf:fonts")
         else:
-            set_if_empty(info.title, detect_title_from_page1(text), text_source)
+            set_if_empty(info.title, detect_title_from_page1_text(text), text_source)
 
-        # Improved YEAR from page 1 text (do this before metadata)
+        # Year from page 1 text
         set_if_empty(info.year, detect_year_from_page1(text), text_source)
 
-    # Crossref enrichment (optional) if DOI found
+    # PubMed enrichment (preferred for official journal abbreviation)
+    if use_pubmed:
+        # DOI-based lookup first (high precision)
+        if info.doi.value:
+            pm = pubmed_lookup_by_doi(info.doi.value)
+            if pm:
+                set_if_empty(info.year, pm.get("year"), "pubmed")
+                set_if_empty(info.journal, pm.get("journal_abbrev"), "pubmed")
+                set_if_empty(info.title, pm.get("title"), "pubmed")
+        # Title-based lookup if still missing key fields
+        if (not info.journal.value or not info.year.value or not info.title.value) and info.title.value:
+            pm2 = pubmed_lookup_by_title(info.title.value)
+            if pm2:
+                set_if_empty(info.year, pm2.get("year"), "pubmed:title")
+                set_if_empty(info.journal, pm2.get("journal_abbrev"), "pubmed:title")
+                set_if_empty(info.title, pm2.get("title"), "pubmed:title")
+
+    # Crossref enrichment (optional fallback)
     if use_crossref and info.doi.value:
         y, j, t = crossref_lookup(info.doi.value)
         set_if_empty(info.year, y, "crossref")
@@ -574,13 +706,13 @@ def enrich_info(pdf_path: Path, info: PdfInfo, use_crossref: bool) -> None:
             set_if_empty(info.doi, detect_doi("\n".join(meta.values())), "metadata")
 
 
-def plan_renames(folder: Path, journal_map: Dict[str, str], use_crossref: bool) -> List[RenamePlan]:
+def plan_renames(folder: Path, journal_map: Dict[str, str], use_pubmed: bool, use_crossref: bool) -> List[RenamePlan]:
     plans: List[RenamePlan] = []
     seen: set[Path] = set()
 
     for src in sorted(folder.glob("*.pdf")):
         info = parse_from_filename(src, journal_map)
-        enrich_info(src, info, use_crossref)
+        enrich_info(src, info, use_pubmed=use_pubmed, use_crossref=use_crossref)
 
         # Title must never be blank
         if not info.title.value:
@@ -645,7 +777,7 @@ def execute(plans: List[RenamePlan], dry_run: bool, log_dir: Path) -> Optional[P
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"rename_log_{now}.csv"
 
-    logs: List[Tuple[str, str, str, str]] = []  # ts, old_path, new_path, status
+    logs: List[Tuple[str, str, str, str]] = []
 
     for p in plans:
         print(
@@ -705,9 +837,9 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=textwrap.dedent(
             """
             Examples:
-              python pdf_renamer.py --dry-run
-              python pdf_renamer.py --dry-run --use-crossref
-              python pdf_renamer.py --report report.csv
+              python pdf_renamer.py --dry-run --use-pubmed
+              python pdf_renamer.py --dry-run --use-pubmed --use-crossref
+              python pdf_renamer.py --use-pubmed
               python pdf_renamer.py --undo logs/rename_log_20260101_120000.csv
               python pdf_renamer.py --undo logs/rename_log_20260101_120000.csv --dry-run
             """
@@ -719,6 +851,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--undo", help="Undo renames using a CSV log file path.")
     parser.add_argument("--log-dir", default="./logs", help="Directory to save rename logs.")
     parser.add_argument("--use-crossref", action="store_true", help="Enable DOI Crossref enrichment.")
+    parser.add_argument("--use-pubmed", action="store_true", help="Enable PubMed enrichment (official journal abbreviation).")
     parser.add_argument("--report", default="report.csv", help="Write rename analysis report CSV.")
     return parser
 
@@ -736,7 +869,7 @@ def main() -> int:
         return 1
 
     journal_map = load_journal_map(Path(args.journals))
-    plans = plan_renames(folder, journal_map, use_crossref=args.use_crossref)
+    plans = plan_renames(folder, journal_map, use_pubmed=args.use_pubmed, use_crossref=args.use_crossref)
 
     if args.report:
         write_report(Path(args.report), plans, args.dry_run)
